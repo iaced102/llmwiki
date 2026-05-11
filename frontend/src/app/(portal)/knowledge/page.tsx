@@ -10,6 +10,8 @@ import { KnowledgeFilters } from "@/components/knowledge/knowledge-filters";
 import { UploadDialog } from "@/components/knowledge/upload-dialog";
 import { KnowledgeTypeCards } from "@/components/types/knowledge-type-cards";
 import { KnowledgeTypeDialog } from "@/components/types/knowledge-type-dialog";
+import { CrawlWebsiteForm } from "@/components/knowledge/crawl-website-form";
+import { CrawlJobsList } from "@/components/knowledge/crawl-jobs-list";
 
 export type KnowledgeType = {
   id: string;
@@ -75,6 +77,20 @@ export default function KnowledgePage() {
   const [typeDialogOpen, setTypeDialogOpen] = useState(false);
   const [editType, setEditType] = useState<KnowledgeType | null>(null);
 
+  // Reload types and departments (called from event handlers, not effects)
+  const loadMeta = useCallback(async () => {
+    try {
+      const [typesData, deptsData] = await Promise.all([
+        api<KnowledgeType[]>("/api/knowledge-types"),
+        api<Department[]>("/api/departments"),
+      ]);
+      setTypes(typesData);
+      setDepartments(deptsData);
+    } catch {
+      // keep existing data on error
+    }
+  }, []);
+
   const loadSources = useCallback(async (silent = false, p = 1, s = "") => {
     if (!silent) setLoading(true);
     try {
@@ -99,7 +115,7 @@ export default function KnowledgePage() {
     } finally {
       if (!silent) setLoading(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [selectedType, selectedDepartment, types]);
 
   // Polling cho trạng thái tài liệu
@@ -115,27 +131,58 @@ export default function KnowledgePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sources, loadSources]);
 
-  const loadMeta = useCallback(async () => {
-    try {
-      const [typesData, deptsData] = await Promise.all([
-        api<KnowledgeType[]>("/api/knowledge-types"),
-        api<Department[]>("/api/departments"),
-      ]);
-      setTypes(typesData);
-      setDepartments(deptsData);
-    } catch {
-      setTypes([]);
-      setDepartments([]);
+  useEffect(() => {
+    let cancelled = false;
+    api<KnowledgeType[]>("/api/knowledge-types")
+      .then((typesData) => {
+        if (!cancelled) setTypes(typesData);
+      })
+      .catch(() => {
+        if (!cancelled) setTypes([]);
+      });
+    api<Department[]>("/api/departments")
+      .then((deptsData) => {
+        if (!cancelled) setDepartments(deptsData);
+      })
+      .catch(() => {
+        if (!cancelled) setDepartments([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [setTypes, setDepartments]);
+
+  // Initial sources load — triggered when filters change (selectedType, selectedDepartment, types)
+  // Inline fetch to satisfy react-hooks/set-state-in-effect (no synchronous setState in effect body)
+  useEffect(() => {
+    let cancelled = false;
+    const params = new URLSearchParams({ page: "1", page_size: String(pageSize) });
+    if (selectedType) {
+      const matchedType = types.find((t) => t.slug === selectedType);
+      if (matchedType) params.set("knowledge_type_id", matchedType.id);
     }
-  }, []);
-
-  useEffect(() => {
-    loadMeta();
-  }, [loadMeta]);
-
-  useEffect(() => {
-    loadSources();
-  }, [loadSources]);
+    if (selectedDepartment) params.set("department_id", selectedDepartment);
+    api<PaginatedSources>(`/api/sources?${params}`)
+      .then((data) => {
+        if (!cancelled) {
+          setSources(data.items);
+          setTotal(data.total);
+          setTotalPages(data.total_pages);
+          setPage(data.page);
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSources([]);
+          setLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+     
+  }, [selectedType, selectedDepartment, types]);
 
   const handleSearch = (q: string) => {
     setSearch(q);
@@ -162,7 +209,7 @@ export default function KnowledgePage() {
               <span className="material-symbols-outlined text-base mr-1">add</span>
               Upload Document
             </Button>
-          ) : (
+          ) : activeTab === "types" ? (
             <Button
               onClick={() => { setEditType(null); setTypeDialogOpen(true); }}
               className="bg-primary text-primary-foreground hover:bg-primary/90"
@@ -170,7 +217,7 @@ export default function KnowledgePage() {
               <span className="material-symbols-outlined text-base mr-1">add</span>
               Add Category
             </Button>
-          )
+          ) : null
         }
       />
 
@@ -183,6 +230,10 @@ export default function KnowledgePage() {
           <TabsTrigger value="types" className="gap-2">
             <span className="material-symbols-outlined text-[18px]">category</span>
             Categories
+          </TabsTrigger>
+          <TabsTrigger value="crawl" className="gap-2">
+            <span className="material-symbols-outlined text-[18px]">travel_explore</span>
+            Crawl Website
           </TabsTrigger>
         </TabsList>
 
@@ -223,6 +274,23 @@ export default function KnowledgePage() {
             onEdit={(t) => { setEditType(t); setTypeDialogOpen(true); }}
             onRefresh={loadMeta}
           />
+        </TabsContent>
+
+        <TabsContent value="crawl" className="mt-0 outline-none">
+          <div className="flex flex-col gap-6 max-w-2xl">
+            <div className="rounded-xl border bg-card p-6 flex flex-col gap-2">
+              <h3 className="text-lg font-semibold">Crawl a Website</h3>
+              <p className="text-sm text-muted-foreground mb-2">
+                Enter a root URL and the system will automatically discover and ingest all pages from that domain into the Knowledge Base.
+              </p>
+              <CrawlWebsiteForm types={types} />
+            </div>
+
+            <div className="flex flex-col gap-3">
+              <h3 className="text-base font-semibold">Recent Crawl Jobs</h3>
+              <CrawlJobsList />
+            </div>
+          </div>
         </TabsContent>
       </Tabs>
 

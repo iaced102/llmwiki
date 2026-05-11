@@ -36,7 +36,10 @@ export function EditSourceDialog({
   const [selectedDepts, setSelectedDepts] = React.useState<string[]>(source.department_ids || []);
 
   React.useEffect(() => {
-    setSelectedDepts(source.department_ids || []);
+    // Reset selected departments when the source changes (e.g. dialog re-opened for a different source)
+    const depts = source.department_ids || [];
+    Promise.resolve().then(() => setSelectedDepts(depts));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [source.id]);
   const [scopeType, setScopeType] = React.useState(source.scope_type || "global");
   const [scopeId, setScopeId] = React.useState(source.scope_id || "");
