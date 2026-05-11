@@ -54,9 +54,10 @@ export function CrawlDiscoverView({ jobId }: Props) {
     return () => { cancelled = true; };
   }, [jobId]);
 
-  // Poll while discovering
+  // Poll while discovering (pending = queued, running = active)
   useEffect(() => {
-    if (!job || job.status !== "running" || notFound) return;
+    if (!job || notFound) return;
+    if (job.status !== "running" && job.status !== "pending") return;
     const id = setInterval(() => {
       api<CrawlJob>(`/api/crawl-jobs/${jobId}`)
         .then((data) => {
@@ -279,14 +280,14 @@ export function CrawlDiscoverView({ jobId }: Props) {
       {/* Discovering — live counter */}
       {isDiscovering && (
         <div className="flex flex-col items-center gap-3 py-10 text-muted-foreground">
-          <span className="material-symbols-outlined animate-spin text-5xl text-primary">
+          <span className="material-symbols-outlined text-5xl text-primary">
             travel_explore
           </span>
           <p className="text-sm">
             Scanning <span className="font-semibold text-foreground">{job.domain}</span> for pages...
           </p>
           <p className="text-2xl font-bold tabular-nums text-foreground">
-            {job.pages_discovered}
+            {job.discovered_urls?.length ?? job.pages_discovered}
           </p>
           <p className="text-xs">URLs discovered</p>
         </div>

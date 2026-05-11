@@ -333,6 +333,21 @@ async def cancel_crawl_job(
     job.status = "cancelled"
     await db.commit()
     await db.refresh(job)
+
+    # Also mark all pending/processing Source records from this job as cancelled
+    # so any already-queued ingest_file_task jobs will abort early
+    from sqlalchemy import select as sa_select
+    from app.database.models import Source
+    stmt = sa_select(Source).where(
+        Source.metadata_["crawl_job_id"].astext == str(job_id),
+        Source.status.in_(["pending", "processing"]),
+    )
+    sources = (await db.execute(stmt)).scalars().all()
+    for source in sources:
+        source.status = "cancelled"
+    if sources:
+        await db.commit()
+
     return _to_response(job)
 
 

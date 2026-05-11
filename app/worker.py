@@ -96,6 +96,11 @@ async def ingest_file_task(ctx: dict, source_id: str):
         if not source.minio_key:
             raise ValueError(f"Source {source_id} has no file in storage")
 
+        # Abort early if source was cancelled (e.g. crawl job was cancelled)
+        if source.status == "cancelled":
+            logger.info(f"ingest_file_task: source {source_id} is cancelled, skipping")
+            return
+
         file_name = source.file_name or source.minio_key.split("/")[-1]
 
         try:
