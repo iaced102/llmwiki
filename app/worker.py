@@ -824,7 +824,7 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str, retry_urls: list[str] | 
                         logger.info(
                             f"crawl_site_task [{crawl_job_id}]: job cancelled, stopping BFS"
                         )
-                        return
+                        return  # exit cleanly — status already "cancelled" in DB
 
                 # ---------------------------------------------------------------
                 # Dedup check at dequeue time (req 2.7)
@@ -1152,7 +1152,7 @@ class WorkerSettings:
     redis_settings = _get_redis_settings()
     max_jobs = settings.worker_max_jobs
     job_timeout = settings.worker_job_timeout
-    max_tries = 3
+    max_tries = 1  # crawl_site_task handles its own retry logic; no ARQ retries
     retry_delay = 10
     health_check_interval = 30
 
