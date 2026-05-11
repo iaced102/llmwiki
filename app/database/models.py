@@ -870,6 +870,68 @@ class EmbeddingJob(Base):
 # Skill Contributions — Pull Request style workflow
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Site Crawler — CrawlJob
+# ---------------------------------------------------------------------------
+
+class CrawlJob(Base):
+    """
+    Represents a single site-crawl session initiated by an Admin.
+    The ARQ task `crawl_site_task` reads and updates this record throughout
+    the BFS crawl lifecycle.
+
+    Status flow: pending → running → completed | failed | cancelled
+    """
+    __tablename__ = "crawl_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    start_url: Mapped[str] = mapped_column(Text, nullable=False)
+    domain: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending",
+        comment="pending | running | completed | failed | cancelled",
+    )
+    knowledge_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    scope_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="global"
+    )
+    scope_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    created_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    # Progress counters
+    pages_discovered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pages_crawled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pages_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pages_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Visited URL dedup store (array of normalized URLs)
+    visited_urls: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Error message if status=failed
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # arq job id
+    job_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_crawl_jobs_status", "status"),
+        Index("ix_crawl_jobs_created_by_id", "created_by_id"),
+    )
+
+
 class SkillContribution(Base):
     """
     A request to create a new skill or update an existing one.

@@ -709,6 +709,371 @@ async def reembed_all_pages_task(ctx: dict, job_id: str) -> None:
         )
 
 
+async def crawl_site_task(ctx: dict, crawl_job_id: str):
+    """
+    arq task: BFS site crawl — renders pages with Playwright via crawl4ai,
+    exports each page to PDF, creates Source records, and enqueues ingest_file_task.
+    """
+    from datetime import datetime, timezone
+
+    from app.database import async_session_factory
+    from app.database.models import CrawlJob, Source
+    from app.services.crawler_utils import (
+        extract_same_domain_links,
+        generate_file_name_from_url,
+        normalize_url,
+    )
+    from app.services.storage_service import storage_service
+
+    job_uuid = uuid.UUID(crawl_job_id)
+
+    # -----------------------------------------------------------------------
+    # 9.1 Status guard and transition
+    # -----------------------------------------------------------------------
+    async with async_session_factory() as session:
+        job = await session.get(CrawlJob, job_uuid)
+        if not job:
+            raise ValueError(f"CrawlJob {crawl_job_id} not found")
+
+        if job.status != "pending":
+            logger.info(
+                f"crawl_site_task: job {crawl_job_id} has status={job.status!r}, skipping"
+            )
+            return
+
+        job.status = "running"
+        await session.commit()
+        logger.info(f"crawl_site_task: job {crawl_job_id} transitioned to running")
+
+    # -----------------------------------------------------------------------
+    # 9.2 + 9.3 BFS crawl loop with Source creation and MinIO upload
+    # -----------------------------------------------------------------------
+    try:
+        # Load job fields needed for the BFS loop
+        async with async_session_factory() as session:
+            job = await session.get(CrawlJob, job_uuid)
+            start_url_raw: str = job.start_url
+            domain: str = job.domain
+            knowledge_type_id = job.knowledge_type_id
+            scope_type: str = job.scope_type
+            scope_id = job.scope_id
+            created_by_id = job.created_by_id
+            # Restore any previously visited URLs (resume support)
+            visited_urls: set[str] = set(job.visited_urls or [])
+
+        start_url = normalize_url(start_url_raw)
+
+        # BFS queue — use a list as a FIFO queue
+        queue: list[str] = []
+        if start_url not in visited_urls:
+            queue.append(start_url)
+            visited_urls.add(start_url)
+            # Persist initial state
+            async with async_session_factory() as session:
+                job = await session.get(CrawlJob, job_uuid)
+                job.visited_urls = list(visited_urls)
+                job.pages_discovered = job.pages_discovered + 1
+                await session.commit()
+
+        # Import crawl4ai here so the worker can start even if crawl4ai is
+        # not installed in non-crawler environments (graceful import error).
+        try:
+            from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                "crawl4ai is not installed. Add it to requirements.txt."
+            ) from exc
+
+        browser_cfg = BrowserConfig(headless=True)
+
+        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+            while queue:
+                current_url = queue.pop(0)
+
+                # ---------------------------------------------------------------
+                # Dedup check at dequeue time (req 2.7)
+                # ---------------------------------------------------------------
+                # visited_urls already contains current_url (added at enqueue),
+                # but if somehow it slipped through, skip it.
+                # The real dedup guard is: we only enqueue URLs not in visited_urls.
+
+                logger.info(f"crawl_site_task [{crawl_job_id}]: crawling {current_url}")
+
+                # ---------------------------------------------------------------
+                # Render page with retry (req 3.1, 3.5)
+                # ---------------------------------------------------------------
+                MAX_RETRIES = 2  # up to 2 additional attempts after the first
+                result = None
+                last_error: Exception | None = None
+
+                for attempt in range(MAX_RETRIES + 1):
+                    try:
+                        run_cfg = CrawlerRunConfig(
+                            page_timeout=30_000,  # 30 s render timeout (ms)
+                        )
+                        result = await crawler.arun(url=current_url, config=run_cfg)
+                        last_error = None
+                        break  # success
+                    except Exception as exc:
+                        last_error = exc
+                        logger.warning(
+                            f"crawl_site_task [{crawl_job_id}]: attempt {attempt + 1} "
+                            f"failed for {current_url}: {exc}"
+                        )
+                        if attempt < MAX_RETRIES:
+                            await asyncio.sleep(2)  # brief back-off before retry
+
+                # ---------------------------------------------------------------
+                # Handle render failure (all retries exhausted)
+                # ---------------------------------------------------------------
+                if last_error is not None or result is None:
+                    logger.error(
+                        f"crawl_site_task [{crawl_job_id}]: all retries exhausted "
+                        f"for {current_url}: {last_error}"
+                    )
+                    async with async_session_factory() as session:
+                        job = await session.get(CrawlJob, job_uuid)
+                        job.pages_failed = job.pages_failed + 1
+                        job.visited_urls = list(visited_urls)
+                        await session.commit()
+                    continue
+
+                # ---------------------------------------------------------------
+                # Handle HTTP error codes (req 3.3, 3.4)
+                # ---------------------------------------------------------------
+                status_code: int = result.status_code or 0
+                if status_code in (401, 403):
+                    logger.info(
+                        f"crawl_site_task [{crawl_job_id}]: HTTP {status_code} "
+                        f"for {current_url} — skipping"
+                    )
+                    async with async_session_factory() as session:
+                        job = await session.get(CrawlJob, job_uuid)
+                        job.pages_skipped = job.pages_skipped + 1
+                        job.visited_urls = list(visited_urls)
+                        await session.commit()
+                    continue
+
+                if status_code >= 400:
+                    logger.warning(
+                        f"crawl_site_task [{crawl_job_id}]: HTTP {status_code} "
+                        f"for {current_url} — failed"
+                    )
+                    async with async_session_factory() as session:
+                        job = await session.get(CrawlJob, job_uuid)
+                        job.pages_failed = job.pages_failed + 1
+                        job.visited_urls = list(visited_urls)
+                        await session.commit()
+                    continue
+
+                # ---------------------------------------------------------------
+                # Export PDF bytes (req 3.2)
+                # ---------------------------------------------------------------
+                pdf_bytes: bytes | None = None
+                try:
+                    # crawl4ai exposes the Playwright page via result.page when
+                    # screenshot/pdf is requested.  We use the pdf attribute if
+                    # available, otherwise fall back to the screenshot bytes.
+                    # The canonical way with crawl4ai ≥ 0.4 is to set
+                    # pdf=True in CrawlerRunConfig and read result.pdf.
+                    if hasattr(result, "pdf") and result.pdf:
+                        pdf_bytes = result.pdf
+                    else:
+                        # Re-run with pdf=True to get the PDF
+                        run_cfg_pdf = CrawlerRunConfig(
+                            page_timeout=30_000,
+                            pdf=True,
+                        )
+                        pdf_result = await asyncio.wait_for(
+                            crawler.arun(url=current_url, config=run_cfg_pdf),
+                            timeout=30,
+                        )
+                        if hasattr(pdf_result, "pdf") and pdf_result.pdf:
+                            pdf_bytes = pdf_result.pdf
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"crawl_site_task [{crawl_job_id}]: PDF export timed out "
+                        f"for {current_url}"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"crawl_site_task [{crawl_job_id}]: PDF export failed "
+                        f"for {current_url}: {exc}"
+                    )
+
+                if not pdf_bytes:
+                    logger.warning(
+                        f"crawl_site_task [{crawl_job_id}]: no PDF bytes for "
+                        f"{current_url} — counting as failed"
+                    )
+                    async with async_session_factory() as session:
+                        job = await session.get(CrawlJob, job_uuid)
+                        job.pages_failed = job.pages_failed + 1
+                        job.visited_urls = list(visited_urls)
+                        await session.commit()
+                    continue
+
+                # ---------------------------------------------------------------
+                # 9.3 Source record creation and MinIO upload
+                # ---------------------------------------------------------------
+                rendered_html: str = result.html or ""
+
+                # Extract <title> tag (req 4.2)
+                page_title: str = current_url  # fallback
+                try:
+                    import re as _re
+                    title_match = _re.search(
+                        r"<title[^>]*>(.*?)</title>",
+                        rendered_html,
+                        _re.IGNORECASE | _re.DOTALL,
+                    )
+                    if title_match:
+                        raw_title = title_match.group(1).strip()
+                        if raw_title:
+                            page_title = raw_title[:500]
+                except Exception:
+                    pass
+
+                file_name = generate_file_name_from_url(current_url)
+                slug = file_name[:-4]  # strip .pdf for the path component
+
+                async with async_session_factory() as session:
+                    # Check for duplicate Source for this URL + CrawlJob (req 4.7)
+                    from sqlalchemy import select as sa_select
+                    existing_stmt = sa_select(Source).where(
+                        Source.url == current_url,
+                        Source.metadata_["crawl_job_id"].astext == crawl_job_id,
+                    )
+                    existing_result = await session.execute(existing_stmt)
+                    existing_source = existing_result.scalars().first()
+
+                    if existing_source is not None:
+                        logger.info(
+                            f"crawl_site_task [{crawl_job_id}]: Source already exists "
+                            f"for {current_url} — skipping"
+                        )
+                        job = await session.get(CrawlJob, job_uuid)
+                        job.pages_skipped = job.pages_skipped + 1
+                        job.visited_urls = list(visited_urls)
+                        await session.commit()
+                        # Still extract links from the rendered HTML
+                    else:
+                        # Create Source record (req 4.1, 4.2, 4.3, 4.6)
+                        source = Source(
+                            source_type="file",
+                            status="pending",
+                            file_name=file_name,
+                            title=page_title,
+                            url=current_url,
+                            knowledge_type_id=knowledge_type_id,
+                            scope_type=scope_type,
+                            scope_id=scope_id,
+                            contributed_by_employee_id=created_by_id,
+                            metadata_={"crawl_job_id": crawl_job_id},
+                        )
+                        session.add(source)
+                        await session.flush()  # get source.id
+
+                        source_id = source.id
+                        minio_key = f"sources/{source_id}/original/{slug}.pdf"
+
+                        # Upload PDF to MinIO (req 4.4)
+                        upload_ok = False
+                        try:
+                            await asyncio.to_thread(
+                                storage_service.upload_file,
+                                minio_key,
+                                pdf_bytes,
+                                "application/pdf",
+                            )
+                            source.minio_key = minio_key
+                            upload_ok = True
+                        except Exception as exc:
+                            logger.error(
+                                f"crawl_site_task [{crawl_job_id}]: MinIO upload failed "
+                                f"for {current_url}: {exc}"
+                            )
+                            source.status = "error"
+                            source.error_message = str(exc)[:500]
+
+                        if upload_ok:
+                            # Enqueue ingest_file_task (req 4.5)
+                            try:
+                                arq_pool = await get_arq_pool()
+                                arq_job = await arq_pool.enqueue_job(
+                                    "ingest_file_task", str(source_id)
+                                )
+                                source.job_id = arq_job.job_id if arq_job else None
+                            except Exception as exc:
+                                logger.error(
+                                    f"crawl_site_task [{crawl_job_id}]: enqueue failed "
+                                    f"for source {source_id}: {exc}"
+                                )
+                                source.status = "error"
+                                source.error_message = (
+                                    f"Failed to enqueue ingest_file_task: {str(exc)[:450]}"
+                                )
+
+                        # Increment pages_crawled only on successful PDF export (req 3.6, 5.3)
+                        job = await session.get(CrawlJob, job_uuid)
+                        job.pages_crawled = job.pages_crawled + 1
+                        job.visited_urls = list(visited_urls)
+                        await session.commit()
+
+                # ---------------------------------------------------------------
+                # Extract links and enqueue new URLs (req 2.3, 2.4, 2.5, 5.2)
+                # ---------------------------------------------------------------
+                new_links = extract_same_domain_links(rendered_html, domain, current_url)
+                new_urls: list[str] = []
+                for link in new_links:
+                    if link not in visited_urls:
+                        visited_urls.add(link)
+                        queue.append(link)
+                        new_urls.append(link)
+
+                if new_urls:
+                    async with async_session_factory() as session:
+                        job = await session.get(CrawlJob, job_uuid)
+                        job.pages_discovered = job.pages_discovered + len(new_urls)
+                        job.visited_urls = list(visited_urls)
+                        await session.commit()
+
+        # -----------------------------------------------------------------------
+        # 9.4 BFS completion
+        # -----------------------------------------------------------------------
+        async with async_session_factory() as session:
+            job = await session.get(CrawlJob, job_uuid)
+            job.status = "completed"
+            job.finished_at = datetime.now(timezone.utc)
+            await session.commit()
+        logger.success(f"crawl_site_task [{crawl_job_id}]: completed")
+
+    except BaseException as exc:
+        # -----------------------------------------------------------------------
+        # 9.4 Unhandled exception → failed
+        # -----------------------------------------------------------------------
+        logger.error(f"crawl_site_task [{crawl_job_id}]: unhandled error: {exc}")
+        error_msg = str(exc)[:500]
+
+        async def _mark_failed() -> None:
+            from datetime import datetime, timezone as _tz
+            from app.database import async_session_factory as _sf
+            from app.database.models import CrawlJob as _CrawlJob
+            async with _sf() as err_session:
+                j = await err_session.get(_CrawlJob, job_uuid)
+                if j:
+                    j.status = "failed"
+                    j.error_message = error_msg
+                    j.finished_at = datetime.now(_tz.utc)
+                    await err_session.commit()
+
+        try:
+            await asyncio.shield(_mark_failed())
+        except Exception:
+            pass
+        raise
+
+
 class WorkerSettings:
     """arq worker configuration."""
 
@@ -716,6 +1081,7 @@ class WorkerSettings:
         ingest_file_task,
         ingest_url_task,
         reembed_all_pages_task,
+        crawl_site_task,
     ]
     redis_settings = _get_redis_settings()
     max_jobs = settings.worker_max_jobs

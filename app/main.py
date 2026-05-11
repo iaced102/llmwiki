@@ -120,6 +120,7 @@ from app.routers import (  # noqa: E402
     admin_settings,
     audit,
     auth,
+    crawl_jobs,
     knowledge_types,
     notes,
     projects,
@@ -134,6 +135,7 @@ from app.routers import (  # noqa: E402
 )
 
 app.include_router(auth.router, prefix="/api", tags=["auth"])
+app.include_router(crawl_jobs.router, prefix="/api", tags=["crawl-jobs"])
 app.include_router(sources.router, prefix="/api", tags=["sources"])
 app.include_router(notes.router, prefix="/api", tags=["notes"])
 app.include_router(wiki_drafts.router, prefix="/api", tags=["wiki-drafts"])
