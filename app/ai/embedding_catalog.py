@@ -80,6 +80,21 @@ EMBEDDING_CATALOG: dict[str, EmbeddingModelSpec] = {
         cost_per_1m_tokens=0.13,
         notes="Highest quality OpenAI embedding. ~6.5x cost of 3-small.",
     ),
+    # --- LiteLLM (universal proxy) ---
+    # Single entry; dimension is fixed at 1536 (most common).
+    # The actual model string is configured freeform in admin settings
+    # (embedding_litellm_model_id). Choose this entry only if your LiteLLM
+    # model returns 1536-dim vectors.
+    "litellm/custom": EmbeddingModelSpec(
+        id="litellm/custom",
+        provider="litellm",
+        model_id="custom",  # overridden at runtime via embedding_litellm_model_id
+        dimension=1536,
+        max_input_tokens=8191,
+        label="LiteLLM (custom)",
+        cost_per_1m_tokens=None,
+        notes="Any 1536-dim embedding model via LiteLLM proxy. Configure URL, API key, and model name in settings.",
+    ),
 }
 
 

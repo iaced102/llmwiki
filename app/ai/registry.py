@@ -47,6 +47,9 @@ def _get_embedding_class(provider: ProviderType) -> type[EmbeddingProvider]:
     elif provider == ProviderType.OPENAI:
         from app.ai.providers.openai_provider import OpenAIEmbedding
         return OpenAIEmbedding
+    elif provider == ProviderType.LITELLM:
+        from app.ai.providers.litellm_provider import LiteLLMEmbedding
+        return LiteLLMEmbedding
     raise ValueError(f"Unsupported embedding provider: {provider}")
 
 
@@ -60,6 +63,9 @@ def _get_llm_class(provider: ProviderType) -> type[LLMProvider]:
     elif provider == ProviderType.ANTHROPIC:
         from app.ai.providers.anthropic_provider import AnthropicLLM
         return AnthropicLLM
+    elif provider == ProviderType.LITELLM:
+        from app.ai.providers.litellm_provider import LiteLLMLLM
+        return LiteLLMLLM
     raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
@@ -70,6 +76,9 @@ def _get_vision_class(provider: ProviderType) -> type[VisionProvider]:
     elif provider == ProviderType.OPENAI:
         from app.ai.providers.openai_provider import OpenAIVision
         return OpenAIVision
+    elif provider == ProviderType.LITELLM:
+        from app.ai.providers.litellm_provider import LiteLLMVision
+        return LiteLLMVision
     raise ValueError(f"Unsupported vision provider: {provider}")
 
 
@@ -208,10 +217,17 @@ class ProviderRegistry:
         )
         base_url = await svc.get("embedding_base_url")
 
+        # For LiteLLM: allow freeform model_id override stored separately
+        model_id = spec.model_id
+        if spec.provider == "litellm":
+            override = await svc.get("embedding_litellm_model_id")
+            if override:
+                model_id = override
+
         return ProviderConfig(
             provider=ProviderType(spec.provider),
             api_key=api_key,
-            model_id=spec.model_id,
+            model_id=model_id,
             base_url=base_url,
             dimensions=spec.dimension,
             extra={"spec_id": spec.id},
@@ -270,6 +286,10 @@ SUPPORTED_PROVIDERS = {
         {"id": "anthropic", "name": "Anthropic", "models": [
             "claude-sonnet-4-20250514", "claude-haiku-4-20250514",
         ]},
+        {"id": "litellm", "name": "LiteLLM", "models": [
+            "gpt-4o", "claude-3-5-sonnet-20241022", "gemini/gemini-2.0-flash",
+            "ollama/llama3", "azure/gpt-4o", "groq/llama-3.1-70b-versatile",
+        ]},
     ],
     "vision": [
         {"id": "google", "name": "Google Gemini", "models": [
@@ -277,6 +297,9 @@ SUPPORTED_PROVIDERS = {
         ]},
         {"id": "openai", "name": "OpenAI", "models": [
             "gpt-4o", "gpt-4o-mini",
+        ]},
+        {"id": "litellm", "name": "LiteLLM", "models": [
+            "gpt-4o", "gemini/gemini-2.0-flash", "ollama/llava",
         ]},
     ],
 }

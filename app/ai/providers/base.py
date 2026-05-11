@@ -25,6 +25,7 @@ class ProviderType(str, Enum):
     OLLAMA = "ollama"
     VOYAGE = "voyage"
     COHERE = "cohere"
+    LITELLM = "litellm"
 
 
 # ---------------------------------------------------------------------------

@@ -57,7 +57,9 @@ ALL_CONFIG_KEYS = [
     ACTIVE_EMBEDDING_MODEL_KEY,  # canonical spec_id, e.g. "openai/text-embedding-3-small"
     "embedding_api_key__google",
     "embedding_api_key__openai",
+    "embedding_api_key__litellm",
     "embedding_base_url",        # optional, custom endpoint (Ollama, Azure, proxy)
+    "embedding_litellm_model_id",  # freeform model ID override when provider=litellm
 
     # --- LLM provider (for summarization, webhook gateway) ---
     "llm_provider",             # "google" | "openai" | "anthropic" | "ollama"

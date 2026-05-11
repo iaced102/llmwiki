@@ -485,8 +485,8 @@ async def retry_source(
     )).scalar_one_or_none()
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
-    if source.status != "error":
-        raise HTTPException(status_code=400, detail="Retry is only allowed for sources in error status")
+    if source.status not in ("error", "ready"):
+        raise HTTPException(status_code=400, detail="Retry is only allowed for sources in error or ready status")
     if source.source_type == "url" and not source.url:
         raise HTTPException(status_code=400, detail="Source has no URL to retry")
     if source.source_type == "file" and not source.minio_key:

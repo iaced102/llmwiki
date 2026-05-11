@@ -3,6 +3,13 @@
 import { useEffect, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { api } from "@/lib/api";
 
 type EmbeddingSpec = {
@@ -37,6 +44,34 @@ type JobResp = {
   error_message: string | null;
 };
 
+type FetchedModel = { name: string; dimension: number | null };
+
+function DimensionHint({
+  fetchedModels,
+  selectedModelId,
+  specDimension,
+}: {
+  fetchedModels: FetchedModel[];
+  selectedModelId: string;
+  specDimension: number | null;
+}) {
+  const sel = fetchedModels.find((m) => m.name === selectedModelId);
+  const modelDim = sel?.dimension ?? null;
+  if (modelDim && specDimension && modelDim !== specDimension) {
+    return (
+      <p className="text-xs text-amber-600 dark:text-amber-400">
+        ⚠ Model dimension ({modelDim}d) không khớp với spec đang chọn ({specDimension}d).
+        Hãy chọn catalog entry <strong>LiteLLM (custom · {modelDim}d)</strong>.
+      </p>
+    );
+  }
+  return (
+    <p className="text-xs text-muted-foreground">
+      {fetchedModels.length} model(s) available{modelDim ? ` · ${modelDim}d` : ""}
+    </p>
+  );
+}
+
 export function EmbeddingSettingsCard() {
   const [catalog, setCatalog] = useState<CatalogResp | null>(null);
   const [status, setStatus] = useState<StatusResp | null>(null);
@@ -45,6 +80,12 @@ export function EmbeddingSettingsCard() {
   // /api/settings; the bullet character means "key already saved server-side".
   const [maskedKeys, setMaskedKeys] = useState<Record<string, string>>({});
   const [apiKey, setApiKey] = useState("");
+  const [litellmUrl, setLitellmUrl] = useState("");
+  const [litellmApiKey, setLitellmApiKey] = useState("");
+  const [litellmModelId, setLitellmModelId] = useState("");
+  const [fetchedModels, setFetchedModels] = useState<{ name: string; dimension: number | null }[]>([]);
+  const [fetching, setFetching] = useState(false);
+  const [fetchError, setFetchError] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -84,6 +125,13 @@ export function EmbeddingSettingsCard() {
         if (typeof v === "string" && v.length > 0) masked[provider] = v;
       }
       setMaskedKeys(masked);
+      // Load litellm freeform config
+      const savedUrl = settings["embedding_base_url"];
+      if (typeof savedUrl === "string") setLitellmUrl(savedUrl);
+      const savedModel = settings["embedding_litellm_model_id"];
+      if (typeof savedModel === "string") setLitellmModelId(savedModel);
+      const savedLitellmKey = settings["embedding_api_key__litellm"];
+      if (typeof savedLitellmKey === "string") setLitellmApiKey(savedLitellmKey);
       if (!selected) setSelected(c.active_spec_id ?? c.specs[0]?.id ?? null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load embedding catalog");
@@ -108,28 +156,37 @@ export function EmbeddingSettingsCard() {
   // bullet character — in that case treat it as "no change".
   const isMaskedKey = apiKey.includes("•");
   const hasNewKey = apiKey.trim().length > 0 && !isMaskedKey;
+  const isLitellmSelected = selectedSpec?.provider === "litellm";
+  const isMaskedLitellmKey = litellmApiKey.includes("•");
   const canSave =
     !!selectedSpec &&
     !jobBusy &&
-    (hasNewKey || (willSwitch && selectedSpec.api_key_configured));
+    (isLitellmSelected
+      ? litellmModelId.trim().length > 0
+      : hasNewKey || (willSwitch && selectedSpec.api_key_configured));
 
   async function handleSave() {
     if (!selectedSpec) return;
     setSaving(true);
     setError("");
     try {
-      // 1. Save API key for this provider only if user typed a new one.
-      if (hasNewKey) {
+      if (isLitellmSelected) {
+        // Save all 3 litellm fields in one call
+        const litellmSettings: Record<string, string> = {
+          embedding_litellm_model_id: litellmModelId.trim(),
+          embedding_base_url: litellmUrl.trim(),
+        };
+        if (litellmApiKey.trim() && !isMaskedLitellmKey) {
+          litellmSettings["embedding_api_key__litellm"] = litellmApiKey.trim();
+        }
+        await api("/api/settings", { method: "PUT", body: { settings: litellmSettings } });
+      } else if (hasNewKey) {
         await api("/api/settings", {
           method: "PUT",
-          body: {
-            settings: {
-              [`embedding_api_key__${selectedSpec.provider}`]: apiKey.trim(),
-            },
-          },
+          body: { settings: { [`embedding_api_key__${selectedSpec.provider}`]: apiKey.trim() } },
         });
       }
-      // 2. Trigger switch if the selected model differs from active.
+      // Trigger switch if the selected model differs from active.
       if (willSwitch) {
         await api("/api/settings/embeddings/switch", {
           method: "POST",
@@ -153,6 +210,40 @@ export function EmbeddingSettingsCard() {
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Cancel failed");
+    }
+  }
+
+  function handleApiKeyFocus() {
+    if (isMaskedKey) setApiKey("");
+  }
+
+  function handleLitellmApiKeyFocus() {
+    if (isMaskedLitellmKey) setLitellmApiKey("");
+  }
+
+  async function fetchModels() {
+    setFetching(true);
+    setFetchError("");
+    try {
+      const params = new URLSearchParams({ capability: "embedding" });
+      if (litellmUrl) params.set("base_url", litellmUrl);
+      if (litellmApiKey && !litellmApiKey.includes("•")) params.set("api_key", litellmApiKey);
+      const data = await api<{ models: { name: string; dimension: number | null }[]; error?: string }>(
+        `/api/settings/litellm-models?${params}`
+      );
+      if (data.error) {
+        setFetchError(data.error);
+        setFetchedModels([]);
+      } else {
+        setFetchedModels(data.models);
+        if (data.models.length > 0 && !data.models.find((m) => m.name === litellmModelId)) {
+          setLitellmModelId(data.models[0].name);
+        }
+      }
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : "Failed to fetch models");
+    } finally {
+      setFetching(false);
     }
   }
 
@@ -240,29 +331,96 @@ export function EmbeddingSettingsCard() {
         })}
       </div>
 
-      {/* API key */}
-      {selectedSpec && (
+      {/* Standard provider: API key */}
+      {selectedSpec && !isLitellmSelected ? (
         <div className="mb-4 flex flex-col gap-1.5">
           <Label className="text-xs">
             API key for {selectedSpec.provider}
-            {selectedSpec.api_key_configured && (
+            {selectedSpec.api_key_configured ? (
               <span className="ml-2 text-green-600 dark:text-green-400">✓ saved</span>
-            )}
+            ) : null}
           </Label>
           <Input
             type={isMaskedKey ? "text" : "password"}
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-            onFocus={() => {
-              if (isMaskedKey) setApiKey("");
-            }}
-            placeholder={
-              selectedSpec.api_key_configured ? "Replace existing key…" : "Paste API key"
-            }
+            onFocus={handleApiKeyFocus}
+            placeholder={selectedSpec.api_key_configured ? "Replace existing key…" : "Paste API key"}
             className="bg-background"
           />
         </div>
-      )}
+      ) : null}
+
+      {/* LiteLLM: 3 freeform inputs */}
+      {isLitellmSelected ? (
+        <div className="mb-4 flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
+            <Label className="text-xs">URL</Label>
+            <Input
+              value={litellmUrl}
+              onChange={(e) => setLitellmUrl(e.target.value)}
+              placeholder="http://localhost:4000"
+              className="bg-background"
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label className="text-xs">API Key</Label>
+            <Input
+              type={isMaskedLitellmKey ? "text" : "password"}
+              value={litellmApiKey}
+              onChange={(e) => setLitellmApiKey(e.target.value)}
+              onFocus={handleLitellmApiKeyFocus}
+              placeholder="sk-... (optional for local proxy)"
+              className="bg-background"
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label className="text-xs">Model Name <span className="text-destructive">*</span></Label>
+            <div className="flex items-center gap-2">
+              {fetchedModels.length > 0 ? (
+                <Select value={litellmModelId} onValueChange={(v) => setLitellmModelId(v ?? "")}>
+                  <SelectTrigger className="bg-background flex-1">
+                    <SelectValue placeholder="Select model" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {fetchedModels.map((m) => (
+                      <SelectItem key={m.name} value={m.name}>
+                        {m.name}{m.dimension ? ` (${m.dimension}d)` : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input
+                  value={litellmModelId}
+                  onChange={(e) => setLitellmModelId(e.target.value)}
+                  placeholder="Fetch models or type manually"
+                  className="bg-background flex-1"
+                />
+              )}
+              <button
+                type="button"
+                onClick={fetchModels}
+                disabled={fetching || !litellmUrl}
+                className="h-9 px-3 rounded-lg border border-border bg-background text-xs hover:bg-accent disabled:opacity-50 flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <span className={`material-symbols-outlined text-sm ${fetching ? "animate-spin" : ""}`}>
+                  {fetching ? "progress_activity" : "refresh"}
+                </span>
+                {fetching ? "Fetching…" : "Fetch"}
+              </button>
+            </div>
+            {fetchError ? <p className="text-xs text-destructive">{fetchError}</p> : null}
+            {!fetchError && fetchedModels.length > 0 ? (
+              <DimensionHint
+                fetchedModels={fetchedModels}
+                selectedModelId={litellmModelId}
+                specDimension={selectedSpec?.dimension ?? null}
+              />
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       {/* Single Save button */}
       <div className="flex items-center gap-3">

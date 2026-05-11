@@ -265,7 +265,7 @@ export function KnowledgeTable({
                           <span className="material-symbols-outlined mr-2" style={{ fontSize: 16 }}>edit</span>
                           Edit
                         </DropdownMenuItem>
-                        {source.status === "error" && (
+                        {(source.status === "error" || source.status === "ready") && (
                           <DropdownMenuItem
                             onClick={() => handleRetry(source.id)}
                             disabled={retryingIds.has(source.id)}

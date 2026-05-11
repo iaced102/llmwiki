@@ -155,3 +155,89 @@ async def list_providers():
     """Get supported providers and models for each capability."""
     from app.ai.registry import SUPPORTED_PROVIDERS
     return SUPPORTED_PROVIDERS
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM — fetch available models from proxy
+# ---------------------------------------------------------------------------
+
+@router.get("/settings/litellm-models")
+async def list_litellm_models(
+    capability: str = "llm",
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = Depends(get_current_user),
+):
+    """
+    Fetch model list from a LiteLLM proxy and filter by capability.
+    base_url / api_key can be passed as query params (current UI values, not yet saved).
+    Falls back to saved config values if not provided.
+    """
+    import httpx
+    from app.services.config_service import ConfigService
+
+    svc = ConfigService(db)
+
+    # Resolve base_url and api_key — prefer query params (user may be editing unsaved values)
+    resolved_base_url = (base_url or "").strip()
+    resolved_api_key = (api_key or "").strip()
+
+    if not resolved_base_url:
+        # Fall back to saved value depending on capability
+        if capability == "embedding":
+            resolved_base_url = await svc.get("embedding_base_url") or ""
+        else:
+            resolved_base_url = await svc.get(f"{capability}_base_url") or ""
+
+    if not resolved_api_key or resolved_api_key.startswith("•"):
+        if capability == "embedding":
+            resolved_api_key = await svc.get("embedding_api_key__litellm") or ""
+        else:
+            resolved_api_key = await svc.get(f"{capability}_api_key") or ""
+
+    if not resolved_base_url:
+        return {"models": [], "error": "No LiteLLM base URL configured"}
+
+    resolved_base_url = resolved_base_url.rstrip("/")
+
+    headers = {}
+    if resolved_api_key:
+        headers["Authorization"] = f"Bearer {resolved_api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{resolved_base_url}/model/info", headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        return {"models": [], "error": f"LiteLLM returned {e.response.status_code}"}
+    except Exception as e:
+        return {"models": [], "error": str(e)}
+
+    models: list[dict] = []
+    for item in data.get("data", []):
+        model_name = item.get("model_name") or item.get("id", "")
+        model_info = item.get("model_info") or {}
+        mode = model_info.get("mode", "")
+        if not model_name:
+            continue
+        if capability == "embedding":
+            if mode == "embedding":
+                # output_vector_size may be None for some providers (e.g. OpenAI via LiteLLM)
+                # Fall back to well-known dimensions
+                KNOWN_DIMS: dict[str, int] = {
+                    "text-embedding-3-small": 1536,
+                    "text-embedding-3-large": 3072,
+                    "text-embedding-ada-002": 1536,
+                }
+                dim = model_info.get("output_vector_size") or KNOWN_DIMS.get(model_name)
+                models.append({"name": model_name, "dimension": dim})
+        elif capability == "vision":
+            if model_info.get("supports_vision") or model_info.get("supports_images"):
+                models.append({"name": model_name, "dimension": None})
+        else:  # llm
+            if mode in ("chat", "completion") or not mode:
+                models.append({"name": model_name, "dimension": None})
+
+    return {"models": sorted(models, key=lambda x: x["name"])}

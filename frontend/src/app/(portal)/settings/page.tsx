@@ -15,18 +15,22 @@ type ProviderConfig = {
   llm_provider: string;
   llm_model_id: string;
   llm_api_key: string;
+  llm_base_url: string;
   vision_provider: string;
   vision_model_id: string;
   vision_api_key: string;
+  vision_base_url: string;
 };
 
 const defaultConfig: ProviderConfig = {
   llm_provider: "",
   llm_model_id: "",
   llm_api_key: "",
+  llm_base_url: "",
   vision_provider: "",
   vision_model_id: "",
   vision_api_key: "",
+  vision_base_url: "",
 };
 
 export default function SettingsPage() {
@@ -113,24 +117,30 @@ export default function SettingsPage() {
           title="LLM Provider"
           description="Used for AI-powered analysis and summarization"
           icon="psychology"
+          capability="llm"
           provider={config.llm_provider}
           model={config.llm_model_id}
           apiKey={config.llm_api_key}
+          baseUrl={config.llm_base_url}
           onProviderChange={(v) => updateField("llm_provider", v)}
           onModelChange={(v) => updateField("llm_model_id", v)}
           onApiKeyChange={(v) => updateField("llm_api_key", v)}
+          onBaseUrlChange={(v) => updateField("llm_base_url", v)}
         />
 
         <ProviderConfigCard
           title="Vision Provider"
           description="Optional — used for image analysis in documents"
           icon="visibility"
+          capability="vision"
           provider={config.vision_provider}
           model={config.vision_model_id}
           apiKey={config.vision_api_key}
+          baseUrl={config.vision_base_url}
           onProviderChange={(v) => updateField("vision_provider", v)}
           onModelChange={(v) => updateField("vision_model_id", v)}
           onApiKeyChange={(v) => updateField("vision_api_key", v)}
+          onBaseUrlChange={(v) => updateField("vision_base_url", v)}
         />
 
         <div className="flex flex-col gap-2">
