@@ -912,6 +912,21 @@ class CrawlJob(Base):
     pages_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Visited URL dedup store (array of normalized URLs)
     visited_urls: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # URLs that failed to crawl — used for retry support
+    failed_urls: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # Discover mode fields
+    mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="crawl",
+        comment="discover | crawl",
+    )
+    discovered_urls: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list,
+        comment="All URLs found during BFS discovery phase",
+    )
+    selected_urls: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list,
+        comment="URLs selected by user to crawl and ingest",
+    )
     # Error message if status=failed
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # arq job id

@@ -709,10 +709,13 @@ async def reembed_all_pages_task(ctx: dict, job_id: str) -> None:
         )
 
 
-async def crawl_site_task(ctx: dict, crawl_job_id: str):
+async def crawl_site_task(ctx: dict, crawl_job_id: str, retry_urls: list[str] | None = None):
     """
     arq task: BFS site crawl — renders pages with Playwright via crawl4ai,
     exports each page to PDF, creates Source records, and enqueues ingest_file_task.
+
+    If retry_urls is provided, the BFS queue is seeded with those URLs instead
+    of start_url (retry mode for failed pages).
     """
     from datetime import datetime, timezone
 
@@ -754,6 +757,7 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str):
             job = await session.get(CrawlJob, job_uuid)
             start_url_raw: str = job.start_url
             domain: str = job.domain
+            job_mode: str = job.mode  # "discover" | "crawl"
             knowledge_type_id = job.knowledge_type_id
             scope_type: str = job.scope_type
             scope_id = job.scope_id
@@ -763,17 +767,33 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str):
 
         start_url = normalize_url(start_url_raw)
 
-        # BFS queue — use a list as a FIFO queue
+        # BFS queue — seed with retry_urls if provided (retry mode),
+        # otherwise start from start_url (normal mode)
         queue: list[str] = []
-        if start_url not in visited_urls:
-            queue.append(start_url)
-            visited_urls.add(start_url)
-            # Persist initial state
-            async with async_session_factory() as session:
-                job = await session.get(CrawlJob, job_uuid)
-                job.visited_urls = list(visited_urls)
-                job.pages_discovered = job.pages_discovered + 1
-                await session.commit()
+        if retry_urls:
+            # Retry mode: only crawl the specific failed URLs
+            for url in retry_urls:
+                normalized = normalize_url(url)
+                if normalized not in visited_urls:
+                    queue.append(normalized)
+                    visited_urls.add(normalized)
+            if queue:
+                async with async_session_factory() as session:
+                    job = await session.get(CrawlJob, job_uuid)
+                    job.visited_urls = list(visited_urls)
+                    job.pages_discovered = len(queue)
+                    await session.commit()
+        else:
+            # Normal mode: start BFS from start_url
+            if start_url not in visited_urls:
+                queue.append(start_url)
+                visited_urls.add(start_url)
+                # Persist initial state
+                async with async_session_factory() as session:
+                    job = await session.get(CrawlJob, job_uuid)
+                    job.visited_urls = list(visited_urls)
+                    job.pages_discovered = job.pages_discovered + 1
+                    await session.commit()
 
         # Import crawl4ai here so the worker can start even if crawl4ai is
         # not installed in non-crawler environments (graceful import error).
@@ -791,13 +811,62 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str):
                 current_url = queue.pop(0)
 
                 # ---------------------------------------------------------------
+                # Cancel check — stop BFS if job was cancelled via API
+                # ---------------------------------------------------------------
+                async with async_session_factory() as session:
+                    _job_check = await session.get(CrawlJob, job_uuid)
+                    if _job_check and _job_check.status == "cancelled":
+                        logger.info(
+                            f"crawl_site_task [{crawl_job_id}]: job cancelled, stopping BFS"
+                        )
+                        return
+
+                # ---------------------------------------------------------------
                 # Dedup check at dequeue time (req 2.7)
                 # ---------------------------------------------------------------
                 # visited_urls already contains current_url (added at enqueue),
                 # but if somehow it slipped through, skip it.
                 # The real dedup guard is: we only enqueue URLs not in visited_urls.
 
-                logger.info(f"crawl_site_task [{crawl_job_id}]: crawling {current_url}")
+                logger.info(f"crawl_site_task [{crawl_job_id}]: {'discovering' if job_mode == 'discover' else 'crawling'} {current_url}")
+
+                # ---------------------------------------------------------------
+                # DISCOVER MODE — fetch page just to extract links, no PDF
+                # ---------------------------------------------------------------
+                if job_mode == "discover":
+                    try:
+                        run_cfg = CrawlerRunConfig(page_timeout=30_000)
+                        result = await crawler.arun(url=current_url, config=run_cfg)
+                        rendered_html = result.html or "" if result else ""
+                    except Exception as exc:
+                        logger.warning(
+                            f"crawl_site_task [{crawl_job_id}]: discover fetch failed "
+                            f"for {current_url}: {exc}"
+                        )
+                        rendered_html = ""
+
+                    # Extract new same-domain links
+                    new_urls: list[str] = []
+                    if rendered_html:
+                        new_links = extract_same_domain_links(rendered_html, domain, current_url)
+                        for link in new_links:
+                            if link not in visited_urls:
+                                visited_urls.add(link)
+                                queue.append(link)
+                                new_urls.append(link)
+
+                    # Single DB write: add current_url + any new links to discovered_urls
+                    async with async_session_factory() as session:
+                        job = await session.get(CrawlJob, job_uuid)
+                        existing_set = set(job.discovered_urls or [])
+                        to_add = ({current_url} | set(new_urls)) - existing_set
+                        if to_add:
+                            job.discovered_urls = list(existing_set | to_add)
+                        job.pages_discovered = len(job.discovered_urls)
+                        job.visited_urls = list(visited_urls)
+                        await session.commit()
+
+                    continue  # skip PDF/Source creation in discover mode
 
                 # ---------------------------------------------------------------
                 # Render page with retry (req 3.1, 3.5)
@@ -834,6 +903,7 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str):
                     async with async_session_factory() as session:
                         job = await session.get(CrawlJob, job_uuid)
                         job.pages_failed = job.pages_failed + 1
+                        job.failed_urls = list(set(job.failed_urls or []) | {current_url})
                         job.visited_urls = list(visited_urls)
                         await session.commit()
                     continue
@@ -862,6 +932,7 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str):
                     async with async_session_factory() as session:
                         job = await session.get(CrawlJob, job_uuid)
                         job.pages_failed = job.pages_failed + 1
+                        job.failed_urls = list(set(job.failed_urls or []) | {current_url})
                         job.visited_urls = list(visited_urls)
                         await session.commit()
                     continue
@@ -909,6 +980,7 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str):
                     async with async_session_factory() as session:
                         job = await session.get(CrawlJob, job_uuid)
                         job.pages_failed = job.pages_failed + 1
+                        job.failed_urls = list(set(job.failed_urls or []) | {current_url})
                         job.visited_urls = list(visited_urls)
                         await session.commit()
                     continue
@@ -997,22 +1069,9 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str):
                             source.error_message = str(exc)[:500]
 
                         if upload_ok:
-                            # Enqueue ingest_file_task (req 4.5)
-                            try:
-                                arq_pool = await get_arq_pool()
-                                arq_job = await arq_pool.enqueue_job(
-                                    "ingest_file_task", str(source_id)
-                                )
-                                source.job_id = arq_job.job_id if arq_job else None
-                            except Exception as exc:
-                                logger.error(
-                                    f"crawl_site_task [{crawl_job_id}]: enqueue failed "
-                                    f"for source {source_id}: {exc}"
-                                )
-                                source.status = "error"
-                                source.error_message = (
-                                    f"Failed to enqueue ingest_file_task: {str(exc)[:450]}"
-                                )
+                            # Source is ready for user to review and manually trigger ingest
+                            # Do NOT auto-enqueue ingest_file_task — user selects pages first
+                            source.status = "pending"
 
                         # Increment pages_crawled only on successful PDF export (req 3.6, 5.3)
                         job = await session.get(CrawlJob, job_uuid)
@@ -1043,10 +1102,12 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str):
         # -----------------------------------------------------------------------
         async with async_session_factory() as session:
             job = await session.get(CrawlJob, job_uuid)
-            job.status = "completed"
+            # Discover mode → "discovered" so FE knows to show URL selection
+            # Crawl mode → "completed"
+            job.status = "discovered" if job_mode == "discover" else "completed"
             job.finished_at = datetime.now(timezone.utc)
             await session.commit()
-        logger.success(f"crawl_site_task [{crawl_job_id}]: completed")
+        logger.success(f"crawl_site_task [{crawl_job_id}]: {job.status}")
 
     except BaseException as exc:
         # -----------------------------------------------------------------------

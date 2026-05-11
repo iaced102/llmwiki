@@ -1,10 +1,13 @@
 """Crawl Jobs router — manage site crawl jobs.
 
 Endpoints:
-  POST   /crawl-jobs          — create a new crawl job (task 2.1)
-  GET    /crawl-jobs          — list crawl jobs, paginated (task 3.1)
-  GET    /crawl-jobs/{job_id} — get crawl job detail (task 3.2)
-  POST   /crawl-jobs/{job_id}/cancel — cancel a crawl job (task 4)
+  POST   /crawl-jobs                        — create a discover job
+  GET    /crawl-jobs                        — list crawl jobs, paginated
+  GET    /crawl-jobs/{job_id}               — get crawl job detail
+  GET    /crawl-jobs/{job_id}/discovered-urls — list discovered URLs
+  POST   /crawl-jobs/{job_id}/start         — start crawl with selected URLs
+  POST   /crawl-jobs/{job_id}/cancel        — cancel a crawl job
+  POST   /crawl-jobs/{job_id}/retry         — retry failed URLs
 """
 
 import uuid
@@ -35,11 +38,16 @@ class CrawlJobCreate(BaseModel):
     scope_id: Optional[uuid.UUID] = None
 
 
+class CrawlJobStartBody(BaseModel):
+    selected_urls: list[str]
+
+
 class CrawlJobResponse(BaseModel):
     id: uuid.UUID
     start_url: str
     domain: str
     status: str
+    mode: str = "crawl"
     knowledge_type_id: Optional[uuid.UUID] = None
     scope_type: str
     scope_id: Optional[uuid.UUID] = None
@@ -48,6 +56,9 @@ class CrawlJobResponse(BaseModel):
     pages_crawled: int
     pages_failed: int
     pages_skipped: int
+    failed_urls: list[str] = []
+    discovered_urls: list[str] = []
+    selected_urls: list[str] = []
     error_message: Optional[str] = None
     job_id: Optional[str] = None
     created_at: str
@@ -63,6 +74,7 @@ def _to_response(job: CrawlJob) -> CrawlJobResponse:
         start_url=job.start_url,
         domain=job.domain,
         status=job.status,
+        mode=job.mode,
         knowledge_type_id=job.knowledge_type_id,
         scope_type=job.scope_type,
         scope_id=job.scope_id,
@@ -71,6 +83,9 @@ def _to_response(job: CrawlJob) -> CrawlJobResponse:
         pages_crawled=job.pages_crawled,
         pages_failed=job.pages_failed,
         pages_skipped=job.pages_skipped,
+        failed_urls=list(job.failed_urls or []),
+        discovered_urls=list(job.discovered_urls or []),
+        selected_urls=list(job.selected_urls or []),
         error_message=job.error_message,
         job_id=job.job_id,
         created_at=job.created_at.isoformat(),
@@ -90,11 +105,6 @@ async def list_crawl_jobs(
     db: AsyncSession = Depends(get_db),
     _user: Employee = Depends(get_current_user),
 ):
-    """Return a paginated list of crawl jobs ordered by created_at descending.
-
-    page_size is enforced between 1 and 100 (default 20).
-    Requirements: 5.6
-    """
     count_stmt = select(func.count(CrawlJob.id))
     total: int = (await db.execute(count_stmt)).scalar_one()
 
@@ -117,7 +127,7 @@ async def list_crawl_jobs(
 
 
 # ---------------------------------------------------------------------------
-# POST /crawl-jobs — create a new crawl job (task 2.1)
+# POST /crawl-jobs — create a discover job (BFS collect links only)
 # ---------------------------------------------------------------------------
 
 @router.post("/crawl-jobs", status_code=201)
@@ -126,11 +136,9 @@ async def create_crawl_job(
     db: AsyncSession = Depends(get_db),
     user: Employee = require_permission("doc:create"),
 ):
-    """Create a new site crawl job and enqueue the background task.
-
-    Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8
+    """Create a discover job: BFS the site to collect all URLs, no PDF rendering.
+    After discovery completes (status='discovered'), user selects URLs and calls /start.
     """
-    # --- Validate URL ---
     try:
         parsed = urlparse(body.start_url)
     except Exception:
@@ -142,30 +150,27 @@ async def create_crawl_job(
             detail="start_url must be an http or https URL with a non-empty hostname",
         )
 
-    # --- Validate scope_type / scope_id ---
     if body.scope_type == "project" and body.scope_id is None:
         raise HTTPException(
             status_code=422,
             detail="scope_id is required when scope_type is 'project'",
         )
 
-    # Extract domain (hostname only, no port)
     domain = parsed.hostname
 
-    # --- Create CrawlJob record ---
     job = CrawlJob(
         start_url=body.start_url,
         domain=domain,
         status="pending",
+        mode="discover",
         knowledge_type_id=body.knowledge_type_id,
         scope_type=body.scope_type,
         scope_id=body.scope_id,
         created_by_id=user.id,
     )
     db.add(job)
-    await db.flush()  # get job.id before enqueue
+    await db.flush()
 
-    # --- Enqueue crawl_site_task ---
     try:
         from app.worker import get_arq_pool
         arq_pool = await get_arq_pool()
@@ -187,7 +192,7 @@ async def create_crawl_job(
 
 
 # ---------------------------------------------------------------------------
-# GET /crawl-jobs/{job_id} — get crawl job detail (task 3.2)
+# GET /crawl-jobs/{job_id} — get crawl job detail
 # ---------------------------------------------------------------------------
 
 @router.get("/crawl-jobs/{job_id}")
@@ -196,11 +201,6 @@ async def get_crawl_job(
     db: AsyncSession = Depends(get_db),
     _user: Employee = Depends(get_current_user),
 ):
-    """Return a single crawl job by ID.
-
-    Returns HTTP 404 if the job does not exist.
-    Requirements: 5.1, 6.3, 6.4
-    """
     job = await db.get(CrawlJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Crawl job not found")
@@ -208,7 +208,107 @@ async def get_crawl_job(
 
 
 # ---------------------------------------------------------------------------
-# POST /crawl-jobs/{job_id}/cancel — cancel a crawl job (task 4)
+# GET /crawl-jobs/{job_id}/discovered-urls — list discovered URLs
+# ---------------------------------------------------------------------------
+
+@router.get("/crawl-jobs/{job_id}/discovered-urls")
+async def get_discovered_urls(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = Depends(get_current_user),
+):
+    """Return the list of URLs discovered during the BFS discovery phase."""
+    job = await db.get(CrawlJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Crawl job not found")
+    return {
+        "job_id": str(job.id),
+        "status": job.status,
+        "discovered_urls": list(job.discovered_urls or []),
+        "total": len(job.discovered_urls or []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /crawl-jobs/{job_id}/start — start crawl with selected URLs
+# ---------------------------------------------------------------------------
+
+@router.post("/crawl-jobs/{job_id}/start", status_code=201)
+async def start_crawl_job(
+    job_id: uuid.UUID,
+    body: CrawlJobStartBody,
+    db: AsyncSession = Depends(get_db),
+    user: Employee = require_permission("doc:create"),
+):
+    """Create a new crawl job seeded with the user-selected URLs.
+
+    - Original job must have status='discovered'.
+    - selected_urls must be non-empty.
+    - Creates a new CrawlJob with mode='crawl' and enqueues crawl_site_task.
+    """
+    original = await db.get(CrawlJob, job_id)
+    if original is None:
+        raise HTTPException(status_code=404, detail="Crawl job not found")
+
+    if original.status != "discovered":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job must have status 'discovered' to start crawl (current: '{original.status}')",
+        )
+
+    if not body.selected_urls:
+        raise HTTPException(status_code=422, detail="selected_urls must not be empty")
+
+    # Validate all selected URLs are from the discovered set
+    discovered_set = set(original.discovered_urls or [])
+    invalid = [u for u in body.selected_urls if u not in discovered_set]
+    if invalid:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Some URLs were not in the discovered set: {invalid[:5]}",
+        )
+
+    new_job = CrawlJob(
+        start_url=original.start_url,
+        domain=original.domain,
+        status="pending",
+        mode="crawl",
+        knowledge_type_id=original.knowledge_type_id,
+        scope_type=original.scope_type,
+        scope_id=original.scope_id,
+        created_by_id=user.id,
+        selected_urls=body.selected_urls,
+        visited_urls=[],
+        failed_urls=[],
+    )
+    db.add(new_job)
+    await db.flush()
+
+    try:
+        from app.worker import get_arq_pool
+        arq_pool = await get_arq_pool()
+        arq_job = await arq_pool.enqueue_job(
+            "crawl_site_task", str(new_job.id),
+            retry_urls=body.selected_urls,  # reuse retry_urls param to seed queue
+        )
+        new_job.job_id = arq_job.job_id if arq_job else None
+    except Exception as exc:
+        logger.error(f"Failed to enqueue crawl_site_task for job {new_job.id}: {exc}")
+        new_job.status = "failed"
+        new_job.error_message = f"Failed to enqueue background task: {str(exc)[:400]}"
+        await db.commit()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to enqueue crawl task. Job created with status 'failed'.",
+        )
+
+    await db.commit()
+    await db.refresh(new_job)
+    return _to_response(new_job)
+
+
+# ---------------------------------------------------------------------------
+# POST /crawl-jobs/{job_id}/cancel — cancel a crawl job
 # ---------------------------------------------------------------------------
 
 _TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
@@ -220,13 +320,6 @@ async def cancel_crawl_job(
     db: AsyncSession = Depends(get_db),
     _user: Employee = Depends(get_current_user),
 ):
-    """Cancel a pending or running crawl job.
-
-    - Returns HTTP 404 if the job does not exist.
-    - Returns HTTP 400 if the job is already in a terminal state.
-    - Sets status to 'cancelled' and returns HTTP 200 otherwise.
-    Requirements: 6.5, 6.6, 6.7
-    """
     job = await db.get(CrawlJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Crawl job not found")
@@ -241,3 +334,202 @@ async def cancel_crawl_job(
     await db.commit()
     await db.refresh(job)
     return _to_response(job)
+
+
+# ---------------------------------------------------------------------------
+# POST /crawl-jobs/{job_id}/retry — retry failed URLs
+# ---------------------------------------------------------------------------
+
+@router.post("/crawl-jobs/{job_id}/retry", status_code=201)
+async def retry_crawl_job(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: Employee = require_permission("doc:create"),
+):
+    """Create a new crawl job that retries only the failed URLs from a previous job."""
+    original = await db.get(CrawlJob, job_id)
+    if original is None:
+        raise HTTPException(status_code=404, detail="Crawl job not found")
+
+    failed_urls = list(original.failed_urls or [])
+    if not failed_urls:
+        raise HTTPException(
+            status_code=400,
+            detail="No failed URLs to retry for this job",
+        )
+
+    new_job = CrawlJob(
+        start_url=original.start_url,
+        domain=original.domain,
+        status="pending",
+        mode="crawl",
+        knowledge_type_id=original.knowledge_type_id,
+        scope_type=original.scope_type,
+        scope_id=original.scope_id,
+        created_by_id=user.id,
+        visited_urls=[],
+        failed_urls=[],
+    )
+    db.add(new_job)
+    await db.flush()
+
+    try:
+        from app.worker import get_arq_pool
+        arq_pool = await get_arq_pool()
+        arq_job = await arq_pool.enqueue_job(
+            "crawl_site_task", str(new_job.id), retry_urls=failed_urls
+        )
+        new_job.job_id = arq_job.job_id if arq_job else None
+    except Exception as exc:
+        logger.error(f"Failed to enqueue retry crawl_site_task for job {new_job.id}: {exc}")
+        new_job.status = "failed"
+        new_job.error_message = f"Failed to enqueue background task: {str(exc)[:400]}"
+        await db.commit()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to enqueue retry task. Job created with status 'failed'.",
+        )
+
+    await db.commit()
+    await db.refresh(new_job)
+    return _to_response(new_job)
+
+
+# ---------------------------------------------------------------------------
+# GET /crawl-jobs/{job_id}/pages — list Source records for a crawl job
+# ---------------------------------------------------------------------------
+
+@router.get("/crawl-jobs/{job_id}/pages")
+async def get_crawl_job_pages(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = Depends(get_current_user),
+):
+    """Return all Source records created by this crawl job."""
+    from sqlalchemy import select as sa_select
+    from app.database.models import Source
+
+    job = await db.get(CrawlJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Crawl job not found")
+
+    stmt = sa_select(Source).where(
+        Source.metadata_["crawl_job_id"].astext == str(job_id)
+    ).order_by(Source.created_at.asc())
+    sources = (await db.execute(stmt)).scalars().all()
+
+    return {
+        "job_id": str(job_id),
+        "pages": [
+            {
+                "id": str(s.id),
+                "title": s.title,
+                "url": s.url,
+                "status": s.status,
+                "error_message": s.error_message,
+                "has_pdf": bool(s.minio_key),
+                "created_at": s.created_at.isoformat(),
+            }
+            for s in sources
+        ],
+        "total": len(sources),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /crawl-jobs/{job_id}/pages/{source_id}/pdf-url — presigned PDF URL
+# ---------------------------------------------------------------------------
+
+@router.get("/crawl-jobs/{job_id}/pages/{source_id}/pdf-url")
+async def get_page_pdf_url(
+    job_id: uuid.UUID,
+    source_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = Depends(get_current_user),
+):
+    """Return a short-lived presigned URL to view the PDF for a crawled page."""
+    from app.database.models import Source
+    from app.services.storage_service import storage_service
+
+    source = await db.get(Source, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if not source.minio_key:
+        raise HTTPException(status_code=404, detail="PDF not available for this page")
+
+    try:
+        url = storage_service.get_presigned_url(source.minio_key, expiry_hours=1)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF URL: {exc}")
+
+    return {"pdf_url": url}
+
+
+# ---------------------------------------------------------------------------
+# POST /crawl-jobs/{job_id}/ingest — enqueue ingest for selected pages
+# ---------------------------------------------------------------------------
+
+class IngestPagesBody(BaseModel):
+    source_ids: list[uuid.UUID]
+
+
+@router.post("/crawl-jobs/{job_id}/ingest")
+async def ingest_crawl_pages(
+    job_id: uuid.UUID,
+    body: IngestPagesBody,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = require_permission("doc:create"),
+):
+    """Enqueue ingest_file_task for the selected Source records.
+
+    Only sources with status 'pending' or 'error' are accepted.
+    """
+    from sqlalchemy import select as sa_select
+    from app.database.models import Source
+    from app.worker import get_arq_pool
+
+    if not body.source_ids:
+        raise HTTPException(status_code=422, detail="source_ids must not be empty")
+
+    job = await db.get(CrawlJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Crawl job not found")
+
+    stmt = sa_select(Source).where(Source.id.in_(body.source_ids))
+    sources = (await db.execute(stmt)).scalars().all()
+
+    if not sources:
+        raise HTTPException(status_code=404, detail="No matching sources found")
+
+    arq_pool = await get_arq_pool()
+    enqueued = []
+    errors = []
+
+    for source in sources:
+        if source.status not in ("pending", "error"):
+            errors.append({
+                "id": str(source.id),
+                "reason": f"status is '{source.status}', expected 'pending' or 'error'",
+            })
+            continue
+        if not source.minio_key:
+            errors.append({"id": str(source.id), "reason": "no PDF in storage"})
+            continue
+        try:
+            arq_job = await arq_pool.enqueue_job("ingest_file_task", str(source.id))
+            source.job_id = arq_job.job_id if arq_job else None
+            source.status = "pending"
+            source.progress = 0
+            source.progress_message = "Queued for ingestion..."
+            source.error_message = None
+            enqueued.append(str(source.id))
+        except Exception as exc:
+            errors.append({"id": str(source.id), "reason": str(exc)[:200]})
+
+    await db.commit()
+
+    return {
+        "enqueued": enqueued,
+        "enqueued_count": len(enqueued),
+        "errors": errors,
+    }
