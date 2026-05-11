@@ -30,6 +30,8 @@ export function CrawlDiscoverView({ jobId }: Props) {
   const [filter, setFilter] = useState("");
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   // Initial load
   useEffect(() => {
@@ -124,6 +126,19 @@ export function CrawlDiscoverView({ jobId }: Props) {
     }
   };
 
+  const handleCancel = async () => {
+    if (!job) return;
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await api(`/api/crawl-jobs/${job.id}/cancel`, { method: "POST" });
+      router.push("/knowledge");
+    } catch (err) {
+      setCancelError(err instanceof ApiError ? err.message : "Failed to cancel.");
+      setCancelling(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-20">
@@ -175,10 +190,39 @@ export function CrawlDiscoverView({ jobId }: Props) {
         </div>
         <p className="text-xs text-muted-foreground mt-1">
           {isDiscovering
-            ? `Found ${job.pages_discovered} URLs so far — still scanning...`
+            ? `Found ${job.discovered_urls?.length ?? job.pages_discovered} URLs so far — still scanning...`
             : `Found ${job.discovered_urls.length} URLs. Select which ones to crawl and ingest.`}
         </p>
       </div>
+
+      {/* Cancel button — shown while discovering */}
+      {isDiscovering && (
+        <div className="flex flex-col gap-2">
+          <div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleCancel}
+              disabled={cancelling}
+            >
+              {cancelling ? (
+                <span className="flex items-center gap-1.5">
+                  <span className="material-symbols-outlined animate-spin text-sm">progress_activity</span>
+                  Cancelling...
+                </span>
+              ) : (
+                <><span className="material-symbols-outlined text-sm mr-1">cancel</span>Cancel Discovery</>
+              )}
+            </Button>
+          </div>
+          {cancelError && (
+            <p className="text-destructive text-xs flex items-center gap-1">
+              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>error</span>
+              {cancelError}
+            </p>
+          )}
+        </div>
+      )
 
       {/* URL selection — only shown when discovered */}
       {isDiscovered && (

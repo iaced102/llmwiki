@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     redis_port: int = Field(default=6379)
     redis_password: str = Field(default="")
     redis_db: int = Field(default=0)
-    worker_max_jobs: int = Field(default=3, description="Max concurrent ingestion jobs")
+    worker_max_jobs: int = Field(default=5, description="Max concurrent ingestion jobs")
     worker_job_timeout: int = Field(default=1800, description="Job timeout in seconds")
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
