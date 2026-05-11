@@ -222,7 +222,7 @@ export function CrawlDiscoverView({ jobId }: Props) {
             </p>
           )}
         </div>
-      )
+      )}
 
       {/* URL selection — only shown when discovered */}
       {isDiscovered && (
