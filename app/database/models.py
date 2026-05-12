@@ -927,6 +927,15 @@ class CrawlJob(Base):
         JSONB, nullable=False, default=list,
         comment="URLs selected by user to crawl and ingest",
     )
+    # Filter options
+    url_pattern: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Optional regex pattern — only URLs matching this pattern are crawled",
+    )
+    max_pages: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Maximum number of pages to discover/crawl (null = unlimited)",
+    )
     # Error message if status=failed
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # arq job id

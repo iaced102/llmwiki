@@ -36,6 +36,8 @@ export function CrawlWebsiteForm({ types }: Props) {
   const router = useRouter();
   const [url, setUrl] = useState("");
   const [typeId, setTypeId] = useState("");
+  const [urlPattern, setUrlPattern] = useState("");
+  const [maxPages, setMaxPages] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [urlError, setUrlError] = useState<string | null>(null);
   const [networkError, setNetworkError] = useState<string | null>(null);
@@ -49,8 +51,13 @@ export function CrawlWebsiteForm({ types }: Props) {
     setNetworkError(null);
 
     try {
-      const body: Record<string, string> = { start_url: url.trim() };
+      const body: Record<string, string | number> = { start_url: url.trim() };
       if (typeId) body.knowledge_type_id = typeId;
+      if (urlPattern.trim()) body.url_pattern = urlPattern.trim();
+      if (maxPages.trim()) {
+        const n = parseInt(maxPages.trim(), 10);
+        if (!isNaN(n) && n > 0) body.max_pages = n;
+      }
 
       const job = await api<CrawlJobResponse>("/api/crawl-jobs", {
         method: "POST",
@@ -146,6 +153,41 @@ export function CrawlWebsiteForm({ types }: Props) {
             ))}
           </SelectContent>
         </Select>
+      </div>
+
+      {/* URL Pattern */}
+      <div className="flex flex-col gap-1.5">
+        <Label htmlFor="crawl-pattern">
+          URL Pattern <span className="text-muted-foreground font-normal">(optional regex)</span>
+        </Label>
+        <Input
+          id="crawl-pattern"
+          type="text"
+          placeholder="e.g. /docs/.* or \.html$"
+          value={urlPattern}
+          onChange={(e) => setUrlPattern(e.target.value)}
+          disabled={submitting}
+          autoComplete="off"
+        />
+        <p className="text-xs text-muted-foreground">Only URLs matching this regex will be discovered and crawled.</p>
+      </div>
+
+      {/* Max Pages */}
+      <div className="flex flex-col gap-1.5">
+        <Label htmlFor="crawl-max-pages">
+          Max Pages <span className="text-muted-foreground font-normal">(optional)</span>
+        </Label>
+        <Input
+          id="crawl-max-pages"
+          type="number"
+          min={1}
+          placeholder="e.g. 100"
+          value={maxPages}
+          onChange={(e) => setMaxPages(e.target.value)}
+          disabled={submitting}
+          className="w-40"
+        />
+        <p className="text-xs text-muted-foreground">Stop after discovering this many pages. Leave empty for unlimited.</p>
       </div>
 
       {/* Network error */}

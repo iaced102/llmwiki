@@ -767,16 +767,31 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str, retry_urls: list[str] | 
             scope_type: str = job.scope_type
             scope_id = job.scope_id
             created_by_id = job.created_by_id
+            url_pattern: str | None = job.url_pattern
+            max_pages: int | None = job.max_pages
             # Restore any previously visited URLs (resume support)
             visited_urls: set[str] = set(job.visited_urls or [])
 
         start_url = normalize_url(start_url_raw)
 
+        # Compile URL pattern regex if provided
+        import re as _re
+        url_regex = _re.compile(url_pattern) if url_pattern else None
+
+        def _url_matches(url: str) -> bool:
+            """Return True if URL should be included (matches pattern or no pattern set)."""
+            if url_regex is None:
+                return True
+            return bool(url_regex.search(url))
+
         # BFS queue — seed with retry_urls if provided (retry mode),
         # otherwise start from start_url (normal mode)
         queue: list[str] = []
+        # fixed_urls_mode: True when crawling a fixed list (from /start or retry)
+        # In this mode, BFS does NOT extract new links — only crawls the seeded URLs
+        fixed_urls_mode = bool(retry_urls)
         if retry_urls:
-            # Retry mode: only crawl the specific failed URLs
+            # Retry/selected mode: only crawl the specific URLs, no BFS expansion
             for url in retry_urls:
                 normalized = normalize_url(url)
                 if normalized not in visited_urls:
@@ -827,6 +842,19 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str, retry_urls: list[str] | 
                         return  # exit cleanly — status already "cancelled" in DB
 
                 # ---------------------------------------------------------------
+                # Max pages check — stop BFS if limit reached
+                # ---------------------------------------------------------------
+                if max_pages is not None:
+                    async with async_session_factory() as session:
+                        _job_check = await session.get(CrawlJob, job_uuid)
+                        current_discovered = _job_check.pages_discovered if _job_check else 0
+                    if current_discovered >= max_pages:
+                        logger.info(
+                            f"crawl_site_task [{crawl_job_id}]: max_pages={max_pages} reached, stopping BFS"
+                        )
+                        break
+
+                # ---------------------------------------------------------------
                 # Dedup check at dequeue time (req 2.7)
                 # ---------------------------------------------------------------
                 # visited_urls already contains current_url (added at enqueue),
@@ -855,7 +883,7 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str, retry_urls: list[str] | 
                     if rendered_html:
                         new_links = extract_same_domain_links(rendered_html, domain, current_url)
                         for link in new_links:
-                            if link not in visited_urls:
+                            if link not in visited_urls and _url_matches(link):
                                 visited_urls.add(link)
                                 queue.append(link)
                                 new_urls.append(link)
@@ -1086,21 +1114,23 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str, retry_urls: list[str] | 
 
                 # ---------------------------------------------------------------
                 # Extract links and enqueue new URLs (req 2.3, 2.4, 2.5, 5.2)
+                # Skip in fixed_urls_mode — only crawl the seeded list
                 # ---------------------------------------------------------------
-                new_links = extract_same_domain_links(rendered_html, domain, current_url)
-                new_urls: list[str] = []
-                for link in new_links:
-                    if link not in visited_urls:
-                        visited_urls.add(link)
-                        queue.append(link)
-                        new_urls.append(link)
+                if not fixed_urls_mode:
+                    new_links = extract_same_domain_links(rendered_html, domain, current_url)
+                    new_urls: list[str] = []
+                    for link in new_links:
+                        if link not in visited_urls and _url_matches(link):
+                            visited_urls.add(link)
+                            queue.append(link)
+                            new_urls.append(link)
 
-                if new_urls:
-                    async with async_session_factory() as session:
-                        job = await session.get(CrawlJob, job_uuid)
-                        job.pages_discovered = job.pages_discovered + len(new_urls)
-                        job.visited_urls = list(visited_urls)
-                        await session.commit()
+                    if new_urls:
+                        async with async_session_factory() as session:
+                            job = await session.get(CrawlJob, job_uuid)
+                            job.pages_discovered = job.pages_discovered + len(new_urls)
+                            job.visited_urls = list(visited_urls)
+                            await session.commit()
 
         # -----------------------------------------------------------------------
         # 9.4 BFS completion

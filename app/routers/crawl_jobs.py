@@ -36,6 +36,8 @@ class CrawlJobCreate(BaseModel):
     knowledge_type_id: Optional[uuid.UUID] = None
     scope_type: str = "workspace"
     scope_id: Optional[uuid.UUID] = None
+    url_pattern: Optional[str] = None
+    max_pages: Optional[int] = None
 
 
 class CrawlJobStartBody(BaseModel):
@@ -59,6 +61,8 @@ class CrawlJobResponse(BaseModel):
     failed_urls: list[str] = []
     discovered_urls: list[str] = []
     selected_urls: list[str] = []
+    url_pattern: Optional[str] = None
+    max_pages: Optional[int] = None
     error_message: Optional[str] = None
     job_id: Optional[str] = None
     created_at: str
@@ -86,6 +90,8 @@ def _to_response(job: CrawlJob) -> CrawlJobResponse:
         failed_urls=list(job.failed_urls or []),
         discovered_urls=list(job.discovered_urls or []),
         selected_urls=list(job.selected_urls or []),
+        url_pattern=job.url_pattern,
+        max_pages=job.max_pages,
         error_message=job.error_message,
         job_id=job.job_id,
         created_at=job.created_at.isoformat(),
@@ -167,6 +173,8 @@ async def create_crawl_job(
         scope_type=body.scope_type,
         scope_id=body.scope_id,
         created_by_id=user.id,
+        url_pattern=body.url_pattern,
+        max_pages=body.max_pages,
     )
     db.add(job)
     await db.flush()
