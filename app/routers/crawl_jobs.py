@@ -241,18 +241,19 @@ async def get_discovered_urls(
 # POST /crawl-jobs/{job_id}/start — start crawl with selected URLs
 # ---------------------------------------------------------------------------
 
-@router.post("/crawl-jobs/{job_id}/start", status_code=201)
+@router.post("/crawl-jobs/{job_id}/start", status_code=200)
 async def start_crawl_job(
     job_id: uuid.UUID,
     body: CrawlJobStartBody,
     db: AsyncSession = Depends(get_db),
     user: Employee = require_permission("doc:create"),
 ):
-    """Create a new crawl job seeded with the user-selected URLs.
+    """Transition the discover job into crawl mode using the user-selected URLs.
 
-    - Original job must have status='discovered'.
-    - selected_urls must be non-empty.
-    - Creates a new CrawlJob with mode='crawl' and enqueues crawl_site_task.
+    Instead of creating a new job, we reuse the existing discover job:
+    - Set mode="crawl", status="pending", selected_urls=body.selected_urls
+    - Enqueue crawl_site_task with retry_urls=selected_urls (fixed list, no BFS expansion)
+    - The discovered_urls from the discover phase are preserved in DB
     """
     original = await db.get(CrawlJob, job_id)
     if original is None:
@@ -276,34 +277,31 @@ async def start_crawl_job(
             detail=f"Some URLs were not in the discovered set: {invalid[:5]}",
         )
 
-    new_job = CrawlJob(
-        start_url=original.start_url,
-        domain=original.domain,
-        status="pending",
-        mode="crawl",
-        knowledge_type_id=original.knowledge_type_id,
-        scope_type=original.scope_type,
-        scope_id=original.scope_id,
-        created_by_id=user.id,
-        selected_urls=body.selected_urls,
-        visited_urls=[],
-        failed_urls=[],
-    )
-    db.add(new_job)
+    # Reuse the same job — transition to crawl mode
+    original.mode = "crawl"
+    original.status = "pending"
+    original.selected_urls = body.selected_urls
+    original.pages_crawled = 0
+    original.pages_failed = 0
+    original.pages_skipped = 0
+    original.failed_urls = []
+    original.visited_urls = []
+    original.finished_at = None
+    original.error_message = None
     await db.flush()
 
     try:
         from app.worker import get_arq_pool
         arq_pool = await get_arq_pool()
         arq_job = await arq_pool.enqueue_job(
-            "crawl_site_task", str(new_job.id),
-            retry_urls=body.selected_urls,  # reuse retry_urls param to seed queue
+            "crawl_site_task", str(original.id),
+            retry_urls=body.selected_urls,  # fixed list — no BFS expansion
         )
-        new_job.job_id = arq_job.job_id if arq_job else None
+        original.job_id = arq_job.job_id if arq_job else None
     except Exception as exc:
-        logger.error(f"Failed to enqueue crawl_site_task for job {new_job.id}: {exc}")
-        new_job.status = "failed"
-        new_job.error_message = f"Failed to enqueue background task: {str(exc)[:400]}"
+        logger.error(f"Failed to enqueue crawl_site_task for job {original.id}: {exc}")
+        original.status = "failed"
+        original.error_message = f"Failed to enqueue background task: {str(exc)[:400]}"
         await db.commit()
         raise HTTPException(
             status_code=500,
@@ -311,8 +309,8 @@ async def start_crawl_job(
         )
 
     await db.commit()
-    await db.refresh(new_job)
-    return _to_response(new_job)
+    await db.refresh(original)
+    return _to_response(original)
 
 
 # ---------------------------------------------------------------------------

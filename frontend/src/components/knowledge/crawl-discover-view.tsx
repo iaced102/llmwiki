@@ -113,11 +113,13 @@ export function CrawlDiscoverView({ jobId }: Props) {
     setStarting(true);
     setStartError(null);
     try {
-      const newJob = await api<{ id: string }>(`/api/crawl-jobs/${job.id}/start`, {
+      // /start now returns the same job (transitioned to crawl mode)
+      await api<{ id: string }>(`/api/crawl-jobs/${job.id}/start`, {
         method: "POST",
         body: { selected_urls: Array.from(selected) },
       });
-      router.push(`/knowledge/crawl-jobs/${newJob.id}`);
+      // Navigate to the same job — it's now in crawl mode
+      router.push(`/knowledge/crawl-jobs/${job.id}`);
     } catch (err) {
       setStartError(
         err instanceof ApiError ? err.message : "Failed to start crawl."

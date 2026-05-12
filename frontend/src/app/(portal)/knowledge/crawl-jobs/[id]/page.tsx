@@ -26,6 +26,7 @@ export default function CrawlJobDetailPage({ params }: Props) {
   // Fetch just enough to decide which view to render
   useEffect(() => {
     let cancelled = false;
+    setMeta(null); // reset on id change to force re-render
     api<CrawlJobMeta>(`/api/crawl-jobs/${id}`)
       .then((data) => { if (!cancelled) setMeta(data); })
       .catch(() => { if (!cancelled) setMeta({ id, mode: "crawl", status: "unknown" }); });
