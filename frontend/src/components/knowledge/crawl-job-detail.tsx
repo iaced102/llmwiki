@@ -282,7 +282,7 @@ export function CrawlJobDetail({ jobId }: Props) {
     );
   }, [pages, filter]);
 
-  // Selection helpers
+  // Selection helpers — only count pages that can be actioned
   const selectedPendingCount = [...selected].filter(
     (id) => pages.find((p) => p.id === id)?.status === "pending"
   ).length;
@@ -291,19 +291,21 @@ export function CrawlJobDetail({ jobId }: Props) {
   ).length;
 
   const allFilteredSelected =
-    filteredPages.length > 0 && filteredPages.every((p) => selected.has(p.id));
+    filteredPages.filter((p) => p.status === "pending" || p.status === "error").length > 0 &&
+    filteredPages.filter((p) => p.status === "pending" || p.status === "error").every((p) => selected.has(p.id));
 
   const toggleAll = () => {
+    const actionable = filteredPages.filter((p) => p.status === "pending" || p.status === "error");
     if (allFilteredSelected) {
       setSelected((prev) => {
         const next = new Set(prev);
-        filteredPages.forEach((p) => next.delete(p.id));
+        actionable.forEach((p) => next.delete(p.id));
         return next;
       });
     } else {
       setSelected((prev) => {
         const next = new Set(prev);
-        filteredPages.forEach((p) => next.add(p.id));
+        actionable.forEach((p) => next.add(p.id));
         return next;
       });
     }
@@ -526,7 +528,7 @@ export function CrawlJobDetail({ jobId }: Props) {
 
           {selected.size > 0 && (
             <p className="text-xs text-muted-foreground -mt-1">
-              {selected.size} selected ({selectedPendingCount} crawled, {selectedErrorCount} failed)
+              {selected.size} selected ({selectedPendingCount} ready to process, {selectedErrorCount} failed)
             </p>
           )}
 
@@ -551,13 +553,17 @@ export function CrawlJobDetail({ jobId }: Props) {
                         previewPage?.id === page.id ? "bg-muted/60" : ""
                       }`}
                     >
-                      {/* Checkbox */}
-                      <input
-                        type="checkbox"
-                        checked={selected.has(page.id)}
-                        onChange={() => togglePage(page.id)}
-                        className="accent-primary w-4 h-4 shrink-0"
-                      />
+                      {/* Checkbox — only for actionable pages */}
+                      {(page.status === "pending" || page.status === "error") ? (
+                        <input
+                          type="checkbox"
+                          checked={selected.has(page.id)}
+                          onChange={() => togglePage(page.id)}
+                          className="accent-primary w-4 h-4 shrink-0"
+                        />
+                      ) : (
+                        <div className="w-4 h-4 shrink-0" />
+                      )}
 
                       {/* Status icon */}
                       <PageStatusIndicator status={page.status} />
