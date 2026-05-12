@@ -281,6 +281,7 @@ async def start_crawl_job(
     original.mode = "crawl"
     original.status = "pending"
     original.selected_urls = body.selected_urls
+    original.pages_discovered = len(body.selected_urls)
     original.pages_crawled = 0
     original.pages_failed = 0
     original.pages_skipped = 0
@@ -288,6 +289,7 @@ async def start_crawl_job(
     original.visited_urls = []
     original.finished_at = None
     original.error_message = None
+    original.max_pages = None  # disable max_pages for crawl phase
     await db.flush()
 
     try:

@@ -883,6 +883,9 @@ async def crawl_site_task(ctx: dict, crawl_job_id: str, retry_urls: list[str] | 
                     if rendered_html:
                         new_links = extract_same_domain_links(rendered_html, domain, current_url)
                         for link in new_links:
+                            # Stop adding if max_pages reached
+                            if max_pages is not None and (len(visited_urls) + len(new_urls)) >= max_pages:
+                                break
                             if link not in visited_urls and _url_matches(link):
                                 visited_urls.add(link)
                                 queue.append(link)
