@@ -541,7 +541,7 @@ async def ingest_crawl_pages(
         try:
             arq_job = await arq_pool.enqueue_job("ingest_file_task", str(source.id))
             source.job_id = arq_job.job_id if arq_job else None
-            source.status = "pending"
+            source.status = "processing"
             source.progress = 0
             source.progress_message = "Queued for ingestion..."
             source.error_message = None
